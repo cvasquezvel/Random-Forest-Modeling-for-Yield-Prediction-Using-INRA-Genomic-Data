@@ -1,0 +1,897 @@
+# Modelamiento en tidymodels con el motor ranger.
+
+**Caso: **
+
+```{r}
+#| label: load package
+#| echo: false
+#| fig-cap: Temperature and ozone level.
+#| warning: false
+
+### Setup ----
+
+# Otras opciones
+options(scipen = 999)    # Eliminar la notación científica
+options(digits = 4)      # Número de decimales
+
+### Load packages ----
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(ggplot2, dplyr, tidyverse, 
+               tidymodels, rsample, parallel, doParallel)
+tidymodels_prefer()
+```
+
+```{r}
+#| label: import data
+#| echo: false
+#| fig-cap: Temperature and ozone level.
+#| warning: false
+
+data(inra)
+
+data <- TRAIN47K %>%
+  bind_cols(yield = YieldBLUE) %>%
+  as.data.frame() %>%
+  mutate_at(vars(starts_with("AX")), factor)
+
+ggplot(data,
+       aes(x = `AX-89760514`,
+           y = yield)) +
+  geom_boxplot()
+```
+
+```{r}
+#| label: data partition
+#| echo: false
+#| warning: false 
+
+### Data partition ----
+
+set.seed(123)
+data_split <- initial_split(data, prop = 0.7)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+```
+
+```{r}
+#| label: parallel process
+#| echo: false
+#| warning: false 
+
+### Parallel process ----
+
+# speed up computation with parallel processing
+
+doParallel::registerDoParallel()
+
+ncores <- parallel::detectCores(logical = TRUE)
+registerDoParallel(cores = ncores)
+
+```
+
+```{r}
+#| label: resample
+#| echo: false
+#| warning: false 
+
+set.seed(234)
+data_folds <- rsample::vfold_cv(data_train,
+                                 v = 20)
+
+```
+
+## Receta de preprocesamiento
+
+En este caso, evitaré transformar a la variable respuesta con la función "log".
+
+```{r}
+
+### Recipe ----
+
+data_rec <- recipe(formula = `yield` ~ .,
+                   x = data_train) %>%
+  # step_select(where(base::is.numeric)) %>%
+  # step_mutate_at(where(base::is.numeric),
+  #                -contains(c("yield")),
+  #                fn = factor) %>%
+  step_impute_mode(all_predictors(),
+                   -all_outcomes()) %>%
+  step_nzv(all_predictors(),
+           -all_outcomes()) %>%
+  step_zv(all_predictors(),
+          -all_outcomes()) #%>%
+# step_pca()#%>%
+# step_dummy(all_predictors(), one_hot = T)
+
+data_prep <- prep(data_rec)
+data_train_prep <- juice(data_prep)
+# data_train_prep <- bake(data_prep, new_data = data_train)
+data_test_prep  <- bake(data_prep, new_data = data_test)
+# data_new_prep  <- bake(data_prep, new_data = data_new)
+```
+
+## Random Forest
+
+En esta sección, veremos como se entrenan, validen y testean modelos no paramétricos, tomando como ejemplo el algoritmo Random Forest. Omitiré muchas cosas del capítulo anterior por ser redundantes.
+
+### Definir especificaciones del modelo
+
+```{r}
+# Inicializar un objeto de regresión lineal
+rf_model_spec <- rand_forest(
+  trees = tune(), 
+  min_n = tune(), 
+  mtry = tune()
+) %>% 
+  # Establecer el modelo de motor
+  set_engine('ranger',                         
+             importance = "permutation") %>% 
+  # Establecer el modo de modelo
+  set_mode('regression')
+```
+
+### Definir fórmula del modelo
+
+A diferencia del capítulo con el motor lm, el motor ranger permite usar al algoritmo Random Forest y este último puede seleccionar a las mejores variables según importancia mediante permutación.
+
+```{r}
+formula_rf = yield ~ .  
+```
+
+### Definir flujo de trabajo
+
+```{r}
+rf_wf <- workflow() %>%
+  add_recipe(data_rec) %>%
+  add_model(rf_model_spec,
+            formula = formula_rf) 
+
+tune_args(rf_wf) #obtener todos los argumentos ajustables posibles en el flujo de trabajo
+```
+
+### Extraer el conjunto de hiperparámetros del modelo
+
+Similar a lo que se realizó con la regresión Lasso. En este caso, definimos un rango de árboles que irá de 50 a 150 solo para hacer más rápida la búsqueda de hiperparámetros. Este método requiere que finalicemos la búsqueda con mtry (número de predictores)
+
+```{r}
+rf_params <- hardhat::extract_parameter_set_dials(rf_wf) %>% 
+  update(trees = trees(range = c(50L, 150L)))
+rf_params <- rf_params %>% 
+  dials::finalize(rf_params)
+rf_params
+```
+
+### Búsqueda del mejor conjunto de Hiperparámtros mediante validación cruzada
+
+En este paso se hará uso de la optimización bayesiana de hiperparámetros, el cual considero que es un proceso más sofisticado y menos costoso que la búsqueda de hiperparámetros regular o por grillas.
+
+```{r}
+#| label: multi_met
+#| echo: false
+#| warning: false 
+multi_met <- yardstick::metric_set(yardstick::rmse, yardstick::rsq,
+                                   yardstick::mape, yardstick::mae)
+```
+
+```{r}
+set.seed(2020)
+tictoc::tic()
+rf_tune <-
+  rf_wf %>%
+  tune_bayes(
+    resamples = data_folds,
+    param_info = rf_params,
+    # por defecto es 5 (número aleatorio de combinaciones (puntos de grilla) de hiperparámetros)
+    initial = 5, 
+    iter = 50,
+    metrics = multi_met, # metric_set(rmse,mae,smape),
+    control = control_bayes(
+      # El corte entero para el número de iteraciones sin mejores resultados.
+      no_improve = 10,
+      extract = identity,
+      save_pred = TRUE,
+      verbose = TRUE#,
+      # parallel_over = "resamples"
+    )
+  )
+tictoc::toc()
+```
+
+### Métricas del rendimiento predictivo en fase de validación cruzada
+
+A partir de este paso tendremos un poco más de cuidado. Sucede que la búsqueda de hiperparámetros crea un objeto que almacena los resultados de cada conjunto de hiperparámetros contrastado en cada folio. Por ello, lo conveniente es primero tener el mejor conjunto de hiperparámetros para luego visualizar el performance predictivo de este mejor conjunto dentro de cada folio.
+
+```{r}
+# plot(rf_bayes_tune)
+autoplot(rf_tune)
+
+rf_tune %>%
+  collect_metrics() %>%
+  dplyr::select(-std_err) %>%
+  pivot_wider(names_from = .metric,
+              values_from = c(mean)) %>%
+  # filter(.metric == "rmse") %>%
+  mutate_if(base::is.numeric, round, 3) %>%
+  dplyr::arrange(rmse) %>%
+  reactable::reactable()
+
+rf_tune %>%
+  collect_metrics() %>%
+  # filter(.metric == "rmse") %>%
+  select(.metric, mean, std_err, min_n, mtry, trees
+  ) %>%
+  pivot_longer(min_n:mtry:trees,
+               values_to = "value",
+               names_to = "parameter") %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_line(show.legend = FALSE) +
+  geom_point(show.legend = FALSE) +
+  geom_errorbar(aes(ymin = mean - std_err,
+                    ymax = mean + std_err)) +
+  facet_grid(.metric~parameter, scales = "free") +
+  labs(x = NULL, y = "RMSE")
+```
+
+### Seleccionar el mejor conjunto de hiperparámetros
+
+```{r}
+best_rf_model <- select_best(rf_tune, "rmse")
+
+final_rf <- finalize_workflow(rf_wf,
+                              best_rf_model)
+final_rf
+```
+
+### Métricas del rendimiento predictivo para el mejor conjunto de hiperparámetros
+
+Ahora rescatamos las métricas del rendimiento predictivo solo para el mejor conjunto de hiperparámetros en la fase de validación cruzada.
+
+```{r}
+# Métricas promedio de todas las particiones
+metrics_rf <- 
+  rf_tune %>% 
+  collect_metrics(summarize = TRUE) %>%
+  dplyr::mutate(modelo = "rf") %>%
+  dplyr::select(-c(.estimator,.config)) %>%
+  dplyr::filter(mtry %in% best_rf_model$mtry,
+                min_n %in% best_rf_model$min_n,
+                trees %in% best_rf_model$trees)
+metrics_rf
+```
+
+```{r}
+# Métricas individuales de cada una de las particiones
+metrics_rf_complete <- 
+  rf_tune %>% 
+  collect_metrics(summarize = FALSE) %>%
+  dplyr::mutate(modelo = "rf") %>%
+  dplyr::select(-c(.config)) %>% 
+  group_by(id, mtry, min_n, trees, .metric) %>%
+  dplyr::summarise(dplyr::across(c(.estimate),
+                                 mean)) %>%
+  dplyr::filter(mtry %in% best_rf_model$mtry,
+                min_n %in% best_rf_model$min_n,
+                trees %in% best_rf_model$trees)
+metrics_rf_complete
+```
+
+```{r}
+# Valores de validación (mae y rmse) obtenidos en cada partición y repetición.
+p1 <- ggplot(
+  data = metrics_rf_complete,
+  aes(x = .estimate, fill = .metric)) +
+  geom_density(alpha = 0.5) +
+  theme_bw() +
+  facet_wrap(. ~ .metric, scales = "free") +
+  geom_vline(
+    data = metrics_rf %>% 
+    rename(".estimate" = "mean"),
+    aes(xintercept = .estimate, colour = .metric), linewidth = 1, alpha = 1,
+    linetype = 2
+  ) +
+  theme(axis.text.x=element_text(angle=90, hjust=0.5))
+p2 <- ggplot(
+  data = metrics_rf_complete,
+  aes(x = .metric, y = .estimate, fill = .metric, color = .metric)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.1) +
+  geom_jitter(width = 0.05, alpha = 0.3) +
+  # coord_flip() +
+  geom_point(
+    data = metrics_rf %>% 
+    rename(".estimate" = "mean"),
+    color = "black", size = 2, alpha = 0.5
+  ) +
+  theme_bw() +
+  facet_wrap(.metric ~ ., scales = "free") 
+
+ggpubr::ggarrange(p1, p2, ncol = 2, common.legend = TRUE, align = "v") %>% 
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Distribución errores de validación cruzada", size = 15)
+  )
+
+```
+
+```{r}
+validation_rf_predictions <- 
+  rf_tune %>% 
+  tune::collect_predictions(summarize = FALSE) %>%
+  dplyr::mutate(modelo = "rf") %>%
+  dplyr::filter(mtry %in% best_rf_model$mtry,
+                min_n %in% best_rf_model$min_n,
+                trees %in% best_rf_model$trees)
+
+p1 <- ggplot(
+  data = validation_rf_predictions,
+  aes(x = yield, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick") +
+  labs(title = "Valor predicho vs valor real") +
+  theme_bw()
+
+p2 <- ggplot(
+  data = validation_rf_predictions,
+  aes(x = .row, y = yield - .pred)
+) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept =  0, color = "firebrick") +
+  labs(title = "Residuos del modelo") +
+  theme_bw()
+
+p3 <- ggplot(
+  data = validation_rf_predictions,
+  aes(x = yield - .pred)
+) +
+  geom_density() + 
+  labs(title = "Distribución residuos del modelo") +
+  theme_bw()
+
+p4 <- ggplot(
+  data = validation_rf_predictions,
+  aes(sample = yield - .pred)
+) +
+  geom_qq() +
+  geom_qq_line(color = "firebrick") +
+  labs(title = "Q-Q residuos del modelo") +
+  theme_bw()
+
+ggpubr::ggarrange(plotlist = list(p1, p2, p3, p4)) %>%
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Distribución residuos", size = 15, face = "bold")
+  )
+
+```
+
+### Entrenamiento del modelo final
+
+```{r}
+rf_model <- final_rf %>%
+  fit(data_train) %>%
+  extract_fit_parsnip()
+```
+
+### Variables más importantes
+
+Ya que hemos creado un modelo con todas las variables, es necesario revisar si existe alguna variable que aporta de forma negativa en el performance predictivo.
+
+```{r}
+# vip::vip(rf_model, num_features = 60)
+
+vi_rf <- 
+  rf_model %>%
+  vip::vi() %>%
+  dplyr::mutate(Sign = ifelse(Importance >= 0, "POS", "NEG"),
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+    Total_Importance = sum(Importance),
+    Importance = Importance/Total_Importance) %>%
+  # dplyr::filter(!Importance == 0) %>%
+  ggplot(aes(x = Importance,
+             y = Variable,
+             fill = Sign)) +
+  geom_col() +
+  geom_text(aes(label = round(Importance,4),
+                y = Variable),
+            x = 0.1) +
+  scale_fill_manual(breaks = c("NEG","POS"),
+                    values = c("red","blue")) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+vi_rf
+```
+
+Se observa que todas las variables aportan de forma positiva salvo "andrena". En este caso, como "andrena" tiene importancia **negativa** se debe eliminar. Adicionalmente, se observa que las variables más imporantes fueron "fruitset", "seeds" y "fruitmass". Probaré repetir el proceso de entrenamiento, considerando las tres variables más importantes. El resto de variables con importancia positiva pero muy baja pueden llegar a tener importancia negativa en algún momento cuando se pruebe otros conjuntos de variables.
+
+### Modificar la receta de preprocesamiento
+
+Con *step_selec* seleccionamos las tres variables más importantes.
+
+```{r}
+
+### Recipe ----
+
+data_rec <- recipe(formula = `yield` ~ .,
+                   x = data_train) %>%
+  step_select(yield, fruitset, seeds, fruitmass) %>%
+  step_mutate_at(where(base::is.numeric),
+                 -contains(c("yield",
+                             "fruitset",
+                             "fruitmass")),
+                 fn = ~log(.))
+
+data_prep <- prep(data_rec)
+data_train_prep <- juice(data_prep)
+# data_train_prep <- bake(data_prep, new_data = data_train)
+data_test_prep  <- bake(data_prep, new_data = data_test)
+data_new_prep  <- bake(data_prep, new_data = data_new)
+```
+
+### Redefinir flujo de trabajo
+
+```{r}
+rf_wf <- workflow() %>%
+  add_recipe(data_rec) %>%
+  add_model(rf_model_spec,
+            formula = formula_rf) 
+
+tune_args(rf_wf) #obtener todos los argumentos ajustables posibles en el flujo de trabajo
+```
+
+### Extraer el conjunto de hiperparámetros del modelo con el mejor conjunto de variables
+
+```{r}
+rf_params <- hardhat::extract_parameter_set_dials(rf_wf) %>% 
+  update(mtry = mtry(range = c(1L, 3L)))
+rf_params <- rf_params %>% 
+  dials::finalize(rf_params)
+rf_params
+```
+
+### Repetir búsqueda del mejor conjunto de Hiperparámtros mediante validación cruzada
+
+```{r}
+set.seed(2020)
+tictoc::tic()
+rf_tune <-
+  rf_wf %>%
+  tune_bayes(
+    resamples = data_folds,
+    param_info = rf_params,
+    # por defecto es 5 (número aleatorio de combinaciones (puntos de grilla) de hiperparámetros)
+    initial = 5, 
+    iter = 50,
+    metrics = multi_met, # metric_set(rmse,mae,smape),
+    control = control_bayes(
+      # El corte entero para el número de iteraciones sin mejores resultados.
+      no_improve = 10,
+      extract = identity,
+      save_pred = TRUE,
+      verbose = TRUE#,
+      # parallel_over = "resamples"
+    )
+  )
+tictoc::toc()
+```
+
+### Métricas del rendimiento predictivo en fase de validación cruzada con el mejor conjunto de variables
+
+```{r}
+# plot(rf_bayes_tune)
+autoplot(rf_tune)
+
+rf_tune %>%
+  collect_metrics() %>%
+  dplyr::select(-std_err) %>%
+  pivot_wider(names_from = .metric,
+              values_from = c(mean)) %>%
+  # filter(.metric == "rmse") %>%
+  mutate_if(base::is.numeric, round, 3) %>%
+  dplyr::arrange(rmse) %>%
+  reactable::reactable()
+
+rf_tune %>%
+  collect_metrics() %>%
+  # filter(.metric == "rmse") %>%
+  select(.metric, mean, std_err, min_n, mtry, trees
+  ) %>%
+  pivot_longer(min_n:mtry:trees,
+               values_to = "value",
+               names_to = "parameter") %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_line(show.legend = FALSE) +
+  geom_point(show.legend = FALSE) +
+  geom_errorbar(aes(ymin = mean - std_err,
+                    ymax = mean + std_err)) +
+  facet_grid(.metric~parameter, scales = "free") +
+  labs(x = NULL, y = "RMSE")
+```
+
+### Seleccionar el mejor conjunto de hiperparámetros con el mejor conjunto de variables
+
+```{r}
+best_rf_model <- select_best(rf_tune, "rmse")
+
+final_rf <- finalize_workflow(rf_wf,
+                              best_rf_model)
+final_rf
+```
+
+### Métricas del rendimiento predictivo para el mejor conjunto de hiperparámetros con el mejor conjunto de variables
+
+Ahora rescatamos las métricas del rendimiento predictivo solo para el mejor conjunto de hiperparámetros en la fase de validación cruzada.
+
+```{r}
+# Métricas promedio de todas las particiones
+metrics_rf <- 
+  rf_tune %>% 
+  collect_metrics(summarize = TRUE) %>%
+  dplyr::mutate(modelo = "rf") %>%
+  dplyr::select(-c(.estimator,.config)) %>%
+  dplyr::filter(mtry %in% best_rf_model$mtry,
+                min_n %in% best_rf_model$min_n,
+                trees %in% best_rf_model$trees)
+metrics_rf
+```
+
+```{r}
+# Métricas individuales de cada una de las particiones
+metrics_rf_complete <- 
+  rf_tune %>% 
+  collect_metrics(summarize = FALSE) %>%
+  dplyr::mutate(modelo = "rf") %>%
+  dplyr::select(-c(.config)) %>% 
+  group_by(id, mtry, min_n, trees, .metric) %>%
+  dplyr::summarise(dplyr::across(c(.estimate),
+                                 mean)) %>%
+  dplyr::filter(mtry %in% best_rf_model$mtry,
+                min_n %in% best_rf_model$min_n,
+                trees %in% best_rf_model$trees)
+metrics_rf_complete
+```
+
+```{r}
+# Valores de validación (mae y rmse) obtenidos en cada partición y repetición.
+p1 <- ggplot(
+  data = metrics_rf_complete,
+  aes(x = .estimate, fill = .metric)) +
+  geom_density(alpha = 0.5) +
+  theme_bw() +
+  facet_wrap(. ~ .metric, scales = "free") +
+  geom_vline(
+    data = metrics_rf %>% 
+    rename(".estimate" = "mean"),
+    aes(xintercept = .estimate, colour = .metric), linewidth = 1, alpha = 1,
+    linetype = 2
+  ) +
+  theme(axis.text.x=element_text(angle=90, hjust=0.5))
+p2 <- ggplot(
+  data = metrics_rf_complete,
+  aes(x = .metric, y = .estimate, fill = .metric, color = .metric)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.1) +
+  geom_jitter(width = 0.05, alpha = 0.3) +
+  # coord_flip() +
+  geom_point(
+    data = metrics_rf %>% 
+    rename(".estimate" = "mean"),
+    color = "black", size = 2, alpha = 0.5
+  ) +
+  theme_bw() +
+  facet_wrap(.metric ~ ., scales = "free") 
+
+ggpubr::ggarrange(p1, p2, ncol = 2, common.legend = TRUE, align = "v") %>% 
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Distribución errores de validación cruzada", size = 15)
+  )
+
+```
+
+```{r}
+validation_rf_predictions <- 
+  rf_tune %>% 
+  tune::collect_predictions(summarize = FALSE) %>%
+  dplyr::mutate(modelo = "rf") %>%
+  dplyr::filter(mtry %in% best_rf_model$mtry,
+                min_n %in% best_rf_model$min_n,
+                trees %in% best_rf_model$trees)
+
+p1 <- ggplot(
+  data = validation_rf_predictions,
+  aes(x = yield, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick") +
+  labs(title = "Valor predicho vs valor real") +
+  theme_bw()
+
+p2 <- ggplot(
+  data = validation_rf_predictions,
+  aes(x = .row, y = yield - .pred)
+) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept =  0, color = "firebrick") +
+  labs(title = "Residuos del modelo") +
+  theme_bw()
+
+p3 <- ggplot(
+  data = validation_rf_predictions,
+  aes(x = yield - .pred)
+) +
+  geom_density() + 
+  labs(title = "Distribución residuos del modelo") +
+  theme_bw()
+
+p4 <- ggplot(
+  data = validation_rf_predictions,
+  aes(sample = yield - .pred)
+) +
+  geom_qq() +
+  geom_qq_line(color = "firebrick") +
+  labs(title = "Q-Q residuos del modelo") +
+  theme_bw()
+
+ggpubr::ggarrange(plotlist = list(p1, p2, p3, p4)) %>%
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Distribución residuos", size = 15, face = "bold")
+  )
+
+```
+
+### Entrenamiento del modelo final con el mejor conjunto de variables
+
+```{r}
+rf_model <- final_rf %>%
+  fit(data_train) %>%
+  extract_fit_parsnip()
+```
+
+### Verificación de la importancia de variables
+
+Ya que hemos creado un modelo con todas las variables, es necesario revisar si existe alguna variable que aporta de forma negativa en el performance predictivo.
+
+```{r}
+# vip::vip(rf_model, num_features = 60)
+
+vi_rf <- 
+  rf_model %>%
+  vip::vi() %>%
+  dplyr::mutate(Sign = ifelse(Importance >= 0, "POS", "NEG"),
+    Importance = abs(Importance),
+    Variable = fct_reorder(Variable, Importance),
+    Total_Importance = sum(Importance),
+    Importance = Importance/Total_Importance) %>%
+  # dplyr::filter(!Importance == 0) %>%
+  ggplot(aes(x = Importance,
+             y = Variable,
+             fill = Sign)) +
+  geom_col() +
+  geom_text(aes(label = round(Importance,4),
+                y = Variable),
+            x = 0.1) +
+  scale_fill_manual(breaks = c("NEG","POS"),
+                    values = c("red","blue")) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+vi_rf
+```
+
+#### Rescatando las especififaciones del modelo para futuras recalibraciones
+
+```{r}
+spec <- rf_model %>% extract_spec_parsnip()
+```
+
+### Testeo interno
+
+Ahora, testeamos el modelo final con los datos de prueba (data_test).
+
+```{r}
+#### Testeo interno ----
+
+# PREDICCIÓN TEST ----
+# =============================================================================
+predicciones <- rf_model %>%
+  predict(
+    new_data = data_test_prep,
+    type = "numeric"
+  )
+
+# MÉTRICAS TEST ----
+# =============================================================================
+predicciones_rf <- predicciones %>% 
+  bind_cols(data_test_prep %>% dplyr::select(yield)) %>%
+  dplyr::mutate(modelo = "rf")
+
+summary(predicciones_rf)
+
+# Error de test
+
+error_test_rf  <- multi_met(
+  data     = predicciones_rf,
+  truth    = yield,
+  estimate = .pred,
+  na_rm    = TRUE
+) %>%
+  dplyr::mutate(
+    modelo = "rf"
+  )
+error_test_rf
+
+combo_plot <- metrics_rf_complete %>% 
+  ggplot(aes(x = .metric, y = .estimate)) +
+  geom_jitter(width = 0.2) +
+  geom_boxplot(width = 0.3, alpha = 0.5) +
+  geom_point(
+    data = metrics_rf %>% rename(".estimate" = "mean"),
+    color = "green", size = 2, alpha = 0.5
+  ) +
+  geom_point(
+    data = error_test_rf,
+    color = "red", size = 2
+  ) +
+  facet_wrap(.metric~., scales = "free")
+combo_plot
+
+pe1 <- ggplot(
+  data = predicciones_rf,
+  aes(x = yield, y = .pred)
+) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick") +
+  labs(title = "Valor predicho vs valor real") +
+  theme_bw()
+
+pe2 <- ggplot(
+  data = predicciones_rf,
+  aes(x = 1:nrow(predicciones_rf), y = yield - .pred)
+) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept =  0, color = "firebrick") +
+  labs(title = "Residuos del modelo",
+       x = ".row")   +
+  theme_bw()
+
+pe3 <- ggplot(
+  data = predicciones_rf,
+  aes(x = yield - .pred)
+) +
+  geom_density() + 
+  labs(title = "Distribución residuos del modelo") +
+  theme_bw()
+
+pe4 <- ggplot(
+  data = predicciones_rf,
+  aes(sample = yield - .pred)
+) +
+  geom_qq() +
+  geom_qq_line(color = "firebrick") +
+  labs(title = "Q-Q residuos del modelo") +
+  theme_bw()
+
+ggpubr::ggarrange(plotlist = list(pe1, pe2, pe3, pe4)) %>%
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Distribución residuos", size = 15, face = "bold")
+  )
+
+```
+
+Se puede observar que no hay evidencia de sobreajuste.
+
+### Recalibración inicial del modelo
+
+```{r}
+rf_model_rec <- rf_model %>%
+  extract_spec_parsnip() %>%
+  fit(
+    formula_rf,
+    data = bind_rows(data_train_prep,
+                     data_test_prep))
+
+```
+
+### Testeo externo
+
+Finalmente, el testeo externo con el conjunto de datos para testeo externo (data_new).
+
+```{r}
+#### Testeo externo ----
+
+# PREDICCIÓN TEST ----
+# =============================================================================
+predicciones_ext <- rf_model_rec %>%
+  predict(
+    new_data = data_new_prep,
+    type = "numeric"
+  )
+
+# MÉTRICAS TEST ----
+# =============================================================================
+predicciones_rf_ext <- predicciones_ext %>% 
+  bind_cols(data_new_prep %>% select(yield)) %>%
+  dplyr::mutate(modelo = "rf")
+
+summary(predicciones_rf_ext)
+
+# Error de test
+
+error_test_rf_ext  <- multi_met(
+  data     = predicciones_rf_ext,
+  truth    = yield,
+  estimate = .pred,
+  na_rm    = TRUE
+) %>%
+  dplyr::mutate(
+    modelo = "rf"
+  )
+error_test_rf_ext
+
+combo_plot <- metrics_rf_complete %>%
+  ggplot(aes(x = .metric, y = .estimate)) +
+  geom_jitter(width = 0.2) +
+  geom_boxplot(width = 0.3, alpha = 0.5) +
+  geom_point(
+    data = metrics_rf %>% rename(".estimate" = "mean"),
+    color = "green", size = 2, alpha = 0.5
+  ) +
+  geom_point(
+    data = error_test_rf,
+    color = "red", size = 2, alpha = 0.5
+  ) +
+  geom_point(
+    data = error_test_rf_ext,
+    color = "blue", size = 2, alpha = 0.5
+  ) +
+  facet_wrap(.metric~., scales = "free")
+combo_plot
+
+pe1 <- ggplot(
+  data = predicciones_rf_ext,
+  aes(x = yield, y = .pred)
+) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick") +
+  labs(title = "Valor predicho vs valor real") +
+  theme_bw()
+
+pe2 <- ggplot(
+  data = predicciones_rf_ext,
+  aes(x = 1:nrow(predicciones_rf_ext), y = yield - .pred)
+) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept =  0, color = "firebrick") +
+  labs(title = "Residuos del modelo",
+       x = ".row")   +
+  theme_bw()
+
+pe3 <- ggplot(
+  data = predicciones_rf_ext,
+  aes(x = yield - .pred)
+) +
+  geom_density() + 
+  labs(title = "Distribución residuos del modelo") +
+  theme_bw()
+
+pe4 <- ggplot(
+  data = predicciones_rf_ext,
+  aes(sample = yield - .pred)
+) +
+  geom_qq() +
+  geom_qq_line(color = "firebrick") +
+  labs(title = "Q-Q residuos del modelo") +
+  theme_bw()
+
+ggpubr::ggarrange(plotlist = list(pe1, pe2, pe3, pe4)) %>%
+  ggpubr::annotate_figure(
+    top = ggpubr::text_grob("Distribución residuos", size = 15, face = "bold")
+  )
+```
+
+Con el nuevo conjunto de variables, se puede observar que el rendimiento predictivo del modelo tiene una variancia un poco mayor en comparación al modelo lineal general.
+
+## Discusión
+
+Una de las cosas que discuto regularmente es el uso de modelos no paramétricos en *Crop Yield Forecast*. Sucede que estos modelos requieren de mayor cantidad de datos a comparación de los modelos paramétricos y adicionalmente tienden a tener un mayor riesgo de sobreajuste en problemas de regresión. Por ello, los modelos no paramétricos son más recomendados en problemas de clasificación y cuando se tiene una gran cantidad de datos.
+
+En mi corta experiencia, he notado que tener una gran cantidad de datos históricos en empresas de agroexportación es muy difícil, debido a que regularmente se instalan nuevas variadades de cultivos o por otro lado, las empresas deciden producir nuevos productos agrícolas debido al crecimiento de su demanda y/o de su precio.
+
+Es por este problema que mi recomendación es usar modelos paramétricos cuando se inicia un proyecto de *Crop Yield Forecast*, hasta que se tenga la suficiente información histórica para cambiar los procesos con algoritmos no paramétricos.
+
+Por otro lado, los modelos paramétricos son menos costosos computacionalmente a comparación de los no paramétricos, por ello, son muy útiles para experimentar con nuevas técnicas de preprocesamiento, procesos de validación de los modelos o aplicar alguna innovación.
